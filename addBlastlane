@@ -1,0 +1,266 @@
+#!/usr/bin/perl -w
+# Authors: Thomas Dybdal Pedersen
+# For license see /usr/biotools/CMG-biotools.license
+
+use Getopt::Long;
+
+#### INPUT CHECK
+my @add;
+my $config;
+my $colour;
+my @name;
+
+if ($#ARGV < 0){
+	print "\n";
+	print "USAGE: addBlastlane -f <newFASTA1> <newFASTA2> -c <configFile> -col <colourGradient> -name <name1> <name2>\n";
+	print "Creates additional blastlanes for a blast atlas and updates the configuration file accordingly.\n";
+	print "\n";
+	print "-f\tThe name(s) of the fasta file(s) to add <REQUIRED>\n";
+	print "-c\tThe name of the config file created by blastAtlasCf <REQUIRED>\n";
+	print "-col\tThe colour of the blast lane given as RRGGBB, with RR being level of red and so forth. Each can go from 00 to 10 (Default is 060010)\n";
+	print "-name\tThe name for each of the given fasta files that should appear in the legend of the plot (Default is the filename)\n";
+	print "\n";
+	exit;
+}
+GetOptions ("f=s{,}"	=> \@add,
+			"c=s"		=> \$config,
+			"col=s"		=> \$colour,
+			"name=s{,}"		=> \@name);
+
+@name = @add unless @name;
+my @queries = @add;
+my $addlength = @add;
+my $namelength = @name;
+die unless $addlength == $namelength;
+
+if($colour){
+	$colour = "101010-".$colour;
+}
+else {
+	$colour = "101010-060010";
+}
+#### END OF INPUT CHECK
+
+
+#### CREATING EXTRA DATA
+my $organism = $config;
+$organism =~ s/.blastatlas.cf//;
+`saco_extract -I genbank -O fasta -t ${organism}.gbk > ${organism}.BAref.fsa`;
+`formatdb -i ${organism}.BAref.fsa -p T`;
+&cm2($colour);
+#### END OF EXTRA DATA CREATION
+
+
+#### CREATING BLAST LANES
+foreach(@queries){
+	print STDOUT "Blasting $_... ";
+	&blastlane($_);
+	print STDOUT "DONE\n";
+}
+#### END OF CREATING BLAST LANES
+
+
+#### MODIFYING CONFIG FILE
+open CONFIG, "<${config}";
+my @newCFG;
+my $dat;
+my $circle;
+my $file;
+my $filewatch;
+while(<CONFIG>){
+	$dat = 1 if /^dat /;
+	$circle = 1 if /^circle /;
+	$file = 1 if /^file /;
+	if((!/^dat / && $dat) && !/^#dat /){
+		my $i=0;
+		foreach (@add){
+			push @newCFG,"dat $_.genomemap.gz 1 0.0 0.0 0.0 \"$name[$i]\";\n";
+			$i++
+		}
+		$dat=0;
+	}
+	if((!/^circle / && $circle) && !/^#circle /){
+		foreach (@add){
+			push @newCFG,"circle $_.genomemap.gz 1 \"$colour.cm2\" by 0.00 100.0;\n";
+		}
+		$circle=0;
+	}
+	if((!/^file / && $file) && !/^#file /){
+		foreach (@add){
+			push @newCFG,"file $_.genomemap.gz dat;\n";
+		}
+		$file=0;
+		$filewatch=1;
+	}
+	push @newCFG,$_;
+}
+if(!$filewatch){
+	foreach (@add){
+		push @newCFG,"file $_.genomemap.gz dat;\n";
+	}
+}
+close CONFIG;
+open NEWCONFIG, ">${config}";
+foreach(@newCFG){
+	print NEWCONFIG;
+}
+close NEWCONFIG;
+#### END OF MODIFYING CONFIG FILE
+
+
+#### SUBROUTINE DEFINITION
+sub extractQuery {
+	open CONFIG, "<", "${config}";
+	my @list;
+	while(<CONFIG>){
+		my @match = /\s.+\.genomemap\.gz/ig;
+		@list = (@list, @match);
+	}
+	my %seen = ();
+	@list = grep { !$seen{$_}++ } @list;
+}
+sub blastlane {
+	my $input = $_[0];
+	`/usr/biotools/blast/bin/blastall -p blastp -d ${organism}.BAref.fsa -i ${input} -e 1e-5 -v 1 -b 1 -m7  > ${input}.proteins.blastreport`;
+	my $line = 1;
+	my %hash;
+	my %hits;
+	open BLASTRES, "<${input}.proteins.blastreport";
+	while ( defined ( $line = <BLASTRES> ) ) {
+		if ($line =~ m/<\/Hsp>/) {
+			if ($hash{'BlastOutput_query-len'}){
+				if ($hash{'BlastOutput_query-len'}){
+					my $qlen = $hash{'BlastOutput_query-len'}+0;
+					my $slen = $hash{'Hit_len'}+0;
+					if ($qlen > $slen) {
+						$hash{"ALR"} = $hash{'Hsp_align-len'} / $qlen;
+					}
+					elsif($qlen <= $slen) {
+						$hash{"ALR"} = $hash{'Hsp_align-len'} / $slen;
+					}
+					if ($hash{"ALR"} > 0.75){
+						$hash{"Hit_def"} =~ /^[^\t]*CDS_(\d+)\-(\d+).*/;
+						$hits{$1}{$2} = $hash{"Hsp_evalue"};
+					}
+					undef(%hash);
+				}
+			}
+		}
+		if ($line =~ m/<(.*)>(.*)<\/.*>/) {
+			$hash{$1} = $2;
+		}
+	}
+	close BLASTRES;
+	my @newAnn;
+	my $evalue;
+	open ANN, "<${organism}.ann";
+	while (<ANN>){
+		next unless /CDS[\s\t]+(\d+)[\s\t]+(\d+)[\s\t]+([\-\+]+)/;
+		my ($start,$stop,$dir) = ($1,$2,$3);
+		undef($evalue);
+		$evalue = $hits{$start}{$stop} if (defined ($hits{$start}{$stop}));
+		$evalue = $hits{$stop}{$start} if (defined ($hits{$stop}{$start}));
+		if ( defined ( $evalue) ) {
+			$evalue = 1e-100 if $evalue == 0;
+		}
+		else {
+			next;
+		}
+		$evalue = sprintf ("%0.4f",-log($evalue));
+		push (@newAnn, "CDS\t${start}\t${stop}\t${dir}\t${evalue}");
+	}
+	close ANN;
+	my $a=0;
+	my $d;
+	my @e;
+	foreach (@newAnn){
+		my @line = split(/\s+/, $_);
+		my $nf = @line;
+		if ($line[2] > $a) {
+			$a = $line[2];
+		}
+		$d = $line[4];
+		for (my $i = $line[1]; $i <= $line[2]; $i++) {
+			$e[$i] = $d;
+		}
+	}
+	my @ans;		
+	for (my $i = 1; $i <= $a; $i++) {
+		if (defined $e[$i]) {
+			$ans[$i-1] = $e[$i]."\n";
+		} else {
+			$ans[$i-1] = "0\n";
+		}
+	}
+	open OUT, ">${input}.genomemap";
+	foreach (@ans){
+		print OUT;
+	}
+	close OUT;
+	`gzip -c ${input}.genomemap > ${input}.genomemap.gz`;
+	
+	my @files = ("${input}.genomemap", "${input}.proteins.blastreport", "formatdb.log", "${organism}.BAref.fsa", "${organism}.BAref.fsa.phr", "${organism}.BAref.fsa.pin", "${organism}.BAref.fsa.psq");
+	foreach (@files){
+		unlink $_ or `rm $_`;
+	}
+	unlink "error.log";
+}
+sub cm2 {
+	# Authors: Peter Fisher Hallin
+	# For license see /usr/biotools/CMG-biotools.license
+	open OUT, ">", "${_[0]}.cm2";
+	select OUT;
+	
+	my @input = split(/[-_]/, $_[0]);
+	my $r = 0.1*substr($input[0], 0, 2);
+	my $g = 0.1*substr($input[0], 2, 2);
+	my $b = 0.1*substr($input[0], 4, 2);
+	
+	printf "%1.2f %1.2f %1.2f\n", 0.3*$r, 0.3*$g, 0.3*$b unless $r == 1 && $g == 1 && $b == 1;
+	
+	my $i;
+	for ($i = 0; $i < $#input; $i++) {
+		$r = 0.1*substr($input[$i], 0, 2);
+		my $rf = 0.1*substr($input[$i+1], 0, 2)-$r;
+		$g = 0.1*substr($input[$i], 2, 2);
+		my $gf = 0.1*substr($input[$i+1], 2, 2)-$g;
+		$b = 0.1*substr($input[$i], 4, 2);
+		my $bf = 0.1*substr($input[$i+1], 4, 2)-$b;
+		my $j = 0;
+		while ($j < 0.895) {
+			printf "%1.2f %1.2f %1.2f\n", 0.9*$r+$j*$rf, 0.9*$g+$j*$gf, 0.9*$b+$j*$bf;
+			if ($rf > 0 || $gf > 0 || $bf > 0) {
+				if ($j < 0.45) {
+					$j += 0.1;
+				}
+				elsif ($j < 0.825) {
+					$j += 0.05;
+				}
+				else {
+		        	$j += 0.01;
+				}
+			}
+			else {
+				if ($j < 0.045) {
+					$j += 0.01;
+				}
+				elsif ($j < 0.375) {
+					$j += 0.05;
+				}
+				else {
+					$j += 0.10;
+				}
+			}
+		}
+	}
+	
+	$r = 0.1*substr($input[$i], 0, 2);
+	$g = 0.1*substr($input[$i], 2, 2);
+	$b = 0.1*substr($input[$i], 4, 2);
+	
+	printf "%1.2f %1.2f %1.2f\n", 0.9*$r, 0.9*$g, 0.9*$b;
+	printf "%1.2f %1.2f %1.2f\n", 0.3*$r, 0.3*$g, 0.3*$b unless $r == 1 && $g == 1 && $b == 1;
+	
+	close OUT;
+}
+#### END OF SUBROUTINE DEFINITION

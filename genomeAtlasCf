@@ -1,0 +1,75 @@
+#!/usr/bin/perl
+
+# Authors: Peter Fisher Hallin, Lars Juhl Jensen, Carsten Friis, Anders Gorm Petersen, Alex Bolshoy, Thomas Pedersen
+# For license see /usr/biotools/CMG-biotools.license
+
+use Getopt::Long;
+
+my $organism;
+
+GetOptions ("ref=s"       => \$organism);
+
+print "You must define a reference genome. Use -ref <reference>.gbk.\n" unless defined $organism;
+exit unless (defined $organism);
+
+$organism =~s/.gbk$//;
+
+chomp(my $length = `/usr/biotools/saco_convert -I genbank -O length $organism.gbk`);
+
+my $lengthtext = $length;
+$lengthtext =~ s/^([0-9]{1,3})(([0-9]{3})+)$/$a=$1; $b=$2; $b =~ s#([0-9]{3})#,\1#g; $a.$b/e;
+
+open GBK, "${organism}.gbk" or die;
+my $name;
+while (<GBK>){
+	if (/^  ORGANISM  /) {
+		s/^  ORGANISM  //;
+		chomp;
+		$name = $_;
+		last;
+	}
+}
+$name =~ s/["]+//g;
+$name =~ s/[']+//g;
+
+open (MYFILE, "> ${organism}.genomeatlas.cf");
+printf MYFILE ("genomesize $length;
+stamp \"GENOME ATLAS\";
+noatlas;
+noatlasscore;
+ann CDS pos 0.0 0.0 1.0 \"CDS +\" fillarrow mark;
+ann CDS neg 1.0 0.0 0.0 \"CDS -\" fillarrow mark;
+ann rRNA 0.0 1.0 1.0 \"rRNA\" fillarrow mark;
+ann rRNA pos 0.0 1.0 1.0 \"rRNA +\" fillarrow mark;
+ann rRNA neg 0.0 1.0 1.0 \"rRNA -\" fillarrow mark;
+ann tRNA 0.0 1.0 0.0 \"tRNA\" fillarrow mark;
+ann tRNA pos 0.0 1.0 0.0 \"tRNA +\" fillarrow mark;
+ann tRNA neg 0.0 1.0 0.0 \"tRNA -\" fillarrow mark;
+dat $organism.curvature.gz 1 0.0 0.0 0.0 \"Intrinsic Curvature\" boxfilter %d;
+dat $organism.ornstein.gz 1 0.0 0.0 0.0 \"Stacking Energy\" boxfilter %d;
+dat $organism.travers.gz 1 0.0 0.0 0.0 \"Position Preference\" boxfilter %d;
+dat $organism.blast.Direct.gz 1 0.0 0.0 0.0 \"Global Direct Repeats\";
+dat $organism.blast.Inverted.gz 1 0.0 0.0 0.0 \"Global Inverted Repeats\";
+dat $organism.baseskews.col.gz 3 0.0 0.0 0.0 \"GC Skew\" boxfilter %d;
+dat $organism.baseskews.col.gz 4 0.0 0.0 0.0 \"Percent AT\" boxfilter %d;
+circletics auto;
+circletext \"$name\" \"$lengthtext bp\";
+circle $organism.baseskews.col.gz 4 \"001010_101010_100000.cm2\" by 0.2 0.8;
+circle $organism.baseskews.col.gz 3 \"100010_101010_001010.cm2\" by avg 3.0 dev;
+circle $organism.blast.Inverted.gz 1 \"101010_100000.cm2\" by 5.0 7.5;
+circle $organism.blast.Direct.gz 1 \"101010_000010.cm2\" by 5.0 7.5;
+circle CDS pos, CDS neg, rRNA, tRNA by dir;
+circle $organism.travers.gz 1 \"001000_101010_100010.cm2\" by avg 3.0 dev;
+circle $organism.ornstein.gz 1 \"001000_101010_100000.cm2\" by avg 3.0 dev;
+circle $organism.curvature.gz 1 \"100600_101010_000010.cm2\" by avg 3.0 dev;
+file $organism.curvature.gz dat;
+file $organism.ornstein.gz dat;
+file $organism.travers.gz dat;
+file $organism.ann ann;
+file $organism.blast.Direct.gz dat;
+file $organism.blast.Inverted.gz dat;
+file $organism.baseskews.col.gz dat;
+"), ((0.002*$length), (0.002*$length), (0.002*$length), (0.001*$length), (0.001*$length));
+
+close MYFILE;
+

@@ -1,0 +1,604 @@
+#!/usr/bin/perl -w
+# Authors: Peter Fisher Hallin
+# For license see /usr/biotools/CMG-biotools.license
+
+$SIG{INT} = \&cleanUp;
+use strict;
+use PostScript::Simple 0.07;
+use XML::Simple;
+use Digest::MD5;
+use Parallel::ChildManager;
+use Getopt::Long;
+
+my $FORMATDB = "/usr/biotools/blast/bin/formatdb";
+
+my ($cpu,$clean);
+
+my $cache_source = "blastp-core+matrix";
+
+&GetOptions (
+ "cpu:s"       ,  \$cpu,        # number of CPUs
+ "clean"  =>  \$clean           # wipe all existing results for this run
+);
+
+my $file =  shift;
+
+die "Usage: blastmatrix [xml-config-file]\n" unless -f $file;
+
+my $pid = $$;
+
+my $scratch = "/tmp/cache-$pid-blastmatrix";
+
+mkdir $scratch unless -e $scratch;
+
+my $TIGRCUT = "/usr/biotools/indirect/tigrcut"; # puts 50% ALR and 50% cutoff identity on an XML output of blastall
+my $BLASTALL = "/usr/biotools/blast/bin/blastall"; # static version of blastall
+
+my $gzip = '/bin/gzip';
+my $perl = '/usr/bin/perl';
+
+my @TEMP_FILES;
+my %lowestFraction;
+my %highestFraction;
+
+$lowestFraction{orthologs} = 1;
+$lowestFraction{paralogs} = 1;
+
+my %entries;
+my %table;
+my @ENTRIES;
+my %INFO;
+my %displayMax;
+my %displayMin;
+my %count_hits;
+my $counter;
+my %taken;
+# read config
+my $xmlcfg = readXML($file);
+
+# temp dir to store all fasta's and blastreports
+$ENV{TMPDIR} = "./cache"; #2.0
+
+$cpu = 1 unless defined $cpu;
+
+# decleare parallel childmanager job
+my $cm = new ChildManager($cpu);
+
+my %tab_h;
+
+&buildFiles();
+&checkFiles();
+&runBlast();
+&extractBlastResults();
+&summerize();
+&setupRanges();
+&printPS();
+&cleanUp(); #uncomment to see the raw BLAST outputs and group files
+
+sub extractBlastResults {
+	my %tab;
+	for ( my $subject_counter = 0 ; $subject_counter < scalar ( @{$xmlcfg->{sources}[0]->{entry}} ) ; $subject_counter++ ) {
+		for ( my $query_counter = 0 ; $query_counter < scalar ( @{$xmlcfg->{sources}[0]->{entry}} ) ; $query_counter++ ) {
+			$tab{"$subject_counter-$query_counter"} = $cm->start();
+			unless ($tab{"$subject_counter-$query_counter"}) {
+				open GROUP , "| $perl /usr/biotools/indirect/group > $scratch/$subject_counter-$query_counter.groups" or die $!;
+				open FSA , "cat $scratch/$subject_counter.fsa $scratch/$query_counter.fsa |" or die $!;
+				while (<FSA>) {
+					chomp;
+					next unless /^>(.*)/;
+					print GROUP  "$1\n";
+				}
+				close FSA;
+				my %HITS;
+				foreach my $direction ( ( "$scratch/$query_counter-$subject_counter.blastout.gz" , "$scratch/$subject_counter-$query_counter.blastout.gz")) {
+					open DIR , "gunzip -c $direction |" or die $!;
+					while (<DIR>) {
+						chomp;
+						my ($a,$b) = split /\t/;
+						$HITS{"$a\t$b"}++;
+						$HITS{"$b\t$a"}++;
+					}
+					close DIR;
+				}
+				foreach my $hit (keys %HITS) {
+					my ($a,$b) = split /\t/ , $hit;
+					if ( $a eq $b ) {
+						print GROUP $hit."\n" if $HITS{$hit} > 0; 
+					} else {
+						print GROUP $hit."\n" if $HITS{$hit} > 1; 
+					}
+				}
+				
+				close GROUP;
+				exit;
+			}
+		}
+	}
+	$cm->wait_all_children;
+}
+
+sub summerize {
+	for ( my $subject_counter = 0 ; $subject_counter < scalar ( @{$xmlcfg->{sources}[0]->{entry}} ) ; $subject_counter++ ) {
+		for ( my $query_counter = 0 ; $query_counter <  scalar ( @{$xmlcfg->{sources}[0]->{entry}} ) ; $query_counter++ ) {
+			my $type;
+			if ($subject_counter == $query_counter) {
+				$type = "paralogs";
+			} else {
+				$type = "orthologs";
+			}
+			$table{$query_counter}{$subject_counter}{type} = $type;
+			$table{$query_counter}{$subject_counter}{sharedfamilies} = 0;
+			open GROUPS , "$scratch/$subject_counter-$query_counter.groups" or die $!;
+			while (<GROUPS>) {
+				chomp;
+				my ($grp_id,$members,@MEMBERS) = split /\t/;
+				$table{$query_counter}{$subject_counter}{totalfamilies}++;
+				if ( $members > 1 ) {
+					$table{$query_counter}{$subject_counter}{sharedfamilies}++;
+				}
+			}
+			close GROUPS;
+			$table{$query_counter}{$subject_counter}{genes} = $INFO{$query_counter}{genes}; 
+			$table{$query_counter}{$subject_counter}{fraction} =   $table{$query_counter}{$subject_counter}{sharedfamilies}/$table{$query_counter}{$subject_counter}{totalfamilies};
+			$table{$query_counter}{$subject_counter}{fractiontext} = sprintf("%0.1f",$table{$query_counter}{$subject_counter}{fraction}*100);
+			$highestFraction{$type} = 0 unless defined $highestFraction{$type};
+			$lowestFraction{$type} = 1 unless defined $lowestFraction{$type};
+			if ($highestFraction{$type} < $table{$query_counter}{$subject_counter}{fraction} ) {
+				$highestFraction{$type} = $table{$query_counter}{$subject_counter}{fraction};
+			}
+			if ($lowestFraction{$type} > $table{$query_counter}{$subject_counter}{fraction} ) {
+				$lowestFraction{$type} = $table{$query_counter}{$subject_counter}{fraction};
+			}
+		}
+	}
+}
+
+sub runBlast {
+	# order is preserved !
+	for ( my $subject_counter = 0 ; $subject_counter < scalar ( @{$xmlcfg->{sources}[0]->{entry}} ) ; $subject_counter++ ) {
+		my $subjectTitle = $INFO{$subject_counter}{title};
+		my $subjectSubtitle = $INFO{$subject_counter}{subtitle};
+		for ( my $query_counter = 0 ; $query_counter < scalar ( @{$xmlcfg->{sources}[0]->{entry}} ) ; $query_counter++ ) {
+			my $queryTitle = $INFO{$query_counter}{title};
+			my $querySubtitle = $INFO{$query_counter}{subtitle};
+			$tab_h{"$query_counter-$subject_counter"} = $cm->start();
+			unless ( $tab_h{"$query_counter-$subject_counter"} ) {
+				my $blastreport_scratch = "$scratch/$query_counter-$subject_counter.blastout.gz";
+				my $jobid = md5 ( "$scratch/$query_counter.fsa" , "$scratch/$subject_counter.fsa" ) ;
+				system "$perl /usr/biotools/indirect/cacher --id='$jobid' --source='$cache_source' -action get > $blastreport_scratch";
+				if ( $? != 0 or $clean or -s $blastreport_scratch == 0) {
+					print STDERR "# jobid $jobid not in cache - redoing\n";
+					my $cmd = "$BLASTALL -F 0 -p blastp -d $scratch/$subject_counter.fsa -e 1e-5 -m 7 < $scratch/$query_counter.fsa | $TIGRCUT | gawk '{print \$1\"\\t\"\$2}' | $gzip > $blastreport_scratch";
+					system $cmd;
+					die "# failed at '$cmd'\n" if $? != 0;
+					system "$perl /usr/biotools/indirect/cacher --id=$jobid --source=$cache_source -action put -expire 100 < $blastreport_scratch";
+				} else {
+						my $s = -s $blastreport_scratch;
+						print STDERR "# fetched jobid $jobid from cache ( $s bytes)\n";
+				}
+			exit;
+			}
+		}
+	}
+	$cm->wait_all_children; 
+}
+
+sub checkFiles {
+	my %JOBS;
+	for ( my $counter = 0 ; $counter < scalar ( @{$xmlcfg->{sources}[0]->{entry}} ) ; $counter++ ) {
+		my $title = $INFO{$counter}{title};
+		my $id = md5("$scratch/$counter.fsa" ) ;
+		if ( defined ( $JOBS{$id}{id}) ) {
+			die ("# id $id re-occured ('".$JOBS{$id}{title}."' and '$title')\n");
+		}
+		$JOBS{$id}{id} = 1;
+		$JOBS{$id}{title} = $title;
+		warn "# $id ($title) ok\n";
+	}
+}
+
+sub buildFiles {
+	my @tab;
+	for ( my $counter = 0 ; $counter < scalar ( @{$xmlcfg->{sources}[0]->{entry}} ) ; $counter++ ) {
+		$INFO{$counter}{title} = $xmlcfg->{sources}[0]->{entry}[$counter]->{title}[0];
+		$INFO{$counter}{subtitle} = $xmlcfg->{sources}[0]->{entry}[$counter]->{subtitle}[0];
+		$tab[$counter] = $cm->start();
+		unless ($tab[$counter]) {
+			my $source = $xmlcfg->{sources}[0]->{entry}[$counter]->{source}[0];
+			print STDERR "# building fasta and blast databases ($source)\n";
+			my ($nprot,$skipped,$checksum) = fasta2fasta ( $source , "$scratch/$counter.fsa" );
+			system "$FORMATDB -i $scratch/$counter.fsa -p T -t 1";
+			print STDERR "# read $nprot entries, $skipped skipped from $INFO{$counter}{title}\n";
+			open NPROT , ">$scratch/$counter.nprot" or die $!;
+			print NPROT "$nprot\n";
+			close NPROT;
+			print STDERR "# done parsing $source\n";
+			exit;
+		}
+	}
+	$cm->wait_all_children; 
+	for ( my $counter = 0 ; $counter < scalar ( @{$xmlcfg->{sources}[0]->{entry}} ) ; $counter++ ) {
+		open NPROT , "$scratch/$counter.nprot" or die "$scratch/$counter.nprot:$!";
+		chomp ( $INFO{$counter}{genes} = <NPROT>);
+		close NPROT;
+	}
+}
+
+sub cleanUp {
+	$SIG{INT} = \&cleanUp;
+	warn "# ##############\n# cleanup: removing $scratch\n# ##############\n";
+	system "rm -rf $scratch";
+}
+
+sub checkConfig {
+	my $return = 1;
+	$return = -1 unless $xmlcfg->{parameters}->{level} =~ m/p.*|n.*/i;
+	return $return;
+}
+
+sub readXML {
+	my $file = shift;
+	# create new xml object
+	my $xml = new XML::Simple;
+	# read XML file
+	return $xml->XMLin($file,forceArray=>1);
+}
+
+sub printPS {
+	my $large = 1; # used with large number of proteomes (~50)
+
+	my $DIM = scalar ( @{$xmlcfg->{sources}[0]->{entry}} );
+	# figure out if groups are being drawn
+		my $draw_groups;
+		foreach my $q ( 1 .. $DIM  ) {
+			if ( defined ( $xmlcfg->{sources}[0]->{entry}[$q-1]->{group}[0]) and defined ($xmlcfg->{sources}[0]->{entry}[$q-1]->{color}[0] ) )  {
+				$draw_groups = 1;
+				}
+		}
+	
+	my $horzVertTextdim = 40 ; # space assigned for text ADJUST HERE!!!!!
+	$horzVertTextdim = 120 if defined $draw_groups;
+
+	my $vertTitleSpace = 30;
+	my $legendHeight = 6;
+	$legendHeight = 12 if $large;
+	my $legendWidth = 80;
+	$legendWidth = 160 if $large;
+	
+	my $legendSteps = 20;
+	my $legendMatrixDistance = 120;
+	my @LEFT_RIGHT_MARGIN = (100,10);
+	my @TOP_BOTTOM_MARGIN = (100,10);
+
+	#OLD settings, before Jan 2012
+	#my $legendMatrixDistance = -20;
+	#my @LEFT_RIGHT_MARGIN = (10,10);
+	#my @TOP_BOTTOM_MARGIN = (10,10);
+
+
+
+	my $BOX_SIZE = 20;
+
+	# obscure!!!!
+	my $R = 1.6;
+	my $R2 = 3;
+	my $V2 = 0.5 * sqrt ( ($BOX_SIZE-$R)**2 + ($BOX_SIZE-$R)**2 );
+	my $V5 = 0.5 * sqrt ( ($BOX_SIZE-$R2)**2 + ($BOX_SIZE-$R2)**2 );
+	my $V = 0.5 * sqrt ( $BOX_SIZE**2 + $BOX_SIZE**2 );
+	my $V3 = sqrt ( $R**2 + $R**2 );
+	my $V4 = sqrt ( $R2**2 / 2 ) * 1.1;
+	my $legendDist = 15;
+	# paper size
+	my $XSIZE = $legendMatrixDistance + ($legendDist + $legendWidth)  + $horzVertTextdim + sqrt ( $BOX_SIZE**2 + $BOX_SIZE**2 ) * $DIM + $LEFT_RIGHT_MARGIN[0] + $LEFT_RIGHT_MARGIN[1];
+	my $YSIZE = $horzVertTextdim + $V * ($DIM + 0.5 ) + $TOP_BOTTOM_MARGIN[0] + $TOP_BOTTOM_MARGIN[1] + $vertTitleSpace + $legendHeight; 
+
+	my @TOP = 
+		($LEFT_RIGHT_MARGIN[0]+$horzVertTextdim + 0.5 * sqrt ( $BOX_SIZE**2 + $BOX_SIZE**2 ) * $DIM , 
+		$YSIZE - $TOP_BOTTOM_MARGIN[0] - $horzVertTextdim
+	);
+
+	my $p = new PostScript::Simple(
+	 xsize => $XSIZE,
+	 ysize => $YSIZE,
+	 colour => 1,
+	 eps => 1,
+	 units => "mm"
+	);
+my $grp_dist = 70;
+my $last_group;
+if ( defined ( $draw_groups ) ) {
+	for ( my $s = 1 ; $s <= $DIM ; $s++) {
+		my $group = $xmlcfg->{sources}[0]->{entry}[$s-1]->{group}[0];
+		my $q = $s;
+		while ($xmlcfg->{sources}[0]->{entry}[$q-1]->{group}[0] eq $group) {
+			$q++ ;
+			last unless defined ( $xmlcfg->{sources}[0]->{entry}[$q-1]->{group}[0]);
+			}
+		$q--;
+		$p->setcolour ( split (',' ,$xmlcfg->{sources}[0]->{entry}[$s-1]->{color}[0] ));
+		my $grp_box_width = 5;
+		my	@BOX = (
+														$TOP[0] + ( $DIM - $s +1) * $V  + $grp_dist - 0.3 , $TOP[1] - (  $DIM - $s +1) * $V + $grp_dist  + 0.3 , 
+														$TOP[0] + ( $DIM - $s +1) * $V  + $grp_dist + $grp_box_width  - 0.3, $TOP[1] - ( $DIM - $s +1) * $V + $grp_dist  + $grp_box_width + 0.3, 
+														$TOP[0] + ( $DIM - $q) * $V  + $grp_dist + 0.3 + $grp_box_width , $TOP[1] - ( $DIM - $q ) * $V + $grp_dist  - 0.3 + $grp_box_width , 
+														$TOP[0] + ( $DIM - $q ) * $V  + $grp_dist + 0.3  , $TOP[1] - ( $DIM -  $q) * $V + $grp_dist  - 0.3  , 
+		);
+		$p->polygon({filled=>1},@BOX);
+
+		@BOX = (
+														$TOP[0] - ( $s - 1) * $V  - $grp_dist - 0.3 , $TOP[1] - (  $s - 1) * $V + $grp_dist  - 0.3 , 
+														$TOP[0] - ( $s - 1) * $V  - $grp_dist - $grp_box_width  - 0.3, $TOP[1] - (  $s - 1) * $V + $grp_dist  + $grp_box_width - 0.3, 
+														$TOP[0] - ( $q  ) * $V  - $grp_dist + 0.3 - $grp_box_width , $TOP[1] - (  $q) * $V + $grp_dist  + 0.3 + $grp_box_width , 
+														$TOP[0] - ( $q ) * $V  - $grp_dist + 0.3  , $TOP[1] - (  $q) * $V + $grp_dist  + 0.3  , 
+		);
+		$p->polygon({filled=>1},@BOX);
+
+		$p->setcolour ( 0 , 0 , 0 );
+		$p->setfont("Palatino-Italic", 30);
+		$p->text({rotate=>'0',align=>'right'},$TOP[0] - ( $s + ($q - $s - 1) / 2  ) * $V  - $grp_dist - 1 - $grp_box_width , $TOP[1] - ( $s + ($q - $s - 1 ) / 2 ) * $V + $grp_dist + 1 + $grp_box_width,  ,$group);
+		$p->text({rotate=>'0',align=>'left'},$TOP[0] + ( $DIM - ( $s + ($q - $s - 1) / 2 ) ) * $V  + $grp_dist + 1 + $grp_box_width , $TOP[1] - ( $DIM - ( $s + ($q - $s - 1 ) / 2 )) * $V + $grp_dist + 1 + $grp_box_width,  ,$group);
+		$s = $q;
+		}
+	}
+
+	$p->setfont("Palatino-Italic", 10);
+	foreach my $s ( 1 .. $DIM  ) {
+		foreach my $q ( $s .. $DIM  ) {
+			my @top = ($TOP[0] + ($DIM-$q)*$V - ($s-1) * $V  , $TOP[1] - ($s-1) * $V - ($DIM - $q) * $V);
+			my $type = "orthologs";
+			$type = "paralogs" if $s == $q;
+			my $fraction = $table{$s-1}{$q-1}{fraction};
+			$p->setcolour ((score2RGB($type,fraction2score($type,$fraction))));
+			my @BOX;
+			if ( $s == $q ) {
+				@BOX = ( $top[0] , $top[1] , $top[0] - $V2, $top[1]-$V2 , $top[0] , $top[1]-2*$V2 , $top[0]+$V2 , $top[1]-$V2);
+				$p->polygon({filled=>1},@BOX);
+				my @BOX = (
+					$top[0] - $V          , $top[1] - $V , 
+					$top[0] - $V + $V4    , $top[1] - $V + $V4 , 
+					$top[0]               , $top[1] - 2 * $V + 2 * $V4 ,
+					$top[0] - $V4         , $top[1] - 2 * $V + $V4
+				);
+				$p->polygon({filled=>1},@BOX);
+				@BOX = (
+					$top[0] + $V          , $top[1] - $V , 
+					$top[0] + $V - $V4    , $top[1] - $V + $V4 , 
+					$top[0]               , $top[1] - 2 * $V + 2 * $V4 ,
+					$top[0] + $V4         , $top[1] - 2 * $V + $V4 
+			);
+				$p->polygon({filled=>1},@BOX);
+				$p->circle( {filled=>1} ,  $top[0] , $top[1]-2*$V5, $R2 );
+			} else {
+				@BOX = ( $top[0] , $top[1] , $top[0] - $V , $top[1]-$V , $top[0] , $top[1]-2*$V , $top[0]+$V , $top[1]-$V);
+				$p->polygon({filled=>1},@BOX);
+			}
+			$p->setcolour ( 0,0,0);
+			$p->setfont("Palatino-Bolditalic", 10);
+			$p->text({rotate=>'0',align=>'center'},($top[0],$top[1]-$V+4), ,$table{$q-1}{$s-1}{fractiontext}." %" );
+			$p->setfont("Palatino-Italic", 10);
+			my $sharedfamilies = $table{$q-1}{$s-1}{sharedfamilies};
+			$sharedfamilies =~ s/(\d{1,3}?)(?=(\d{3})+$)/$1,/g;
+			my $totalfamilies = $table{$q-1}{$s-1}{totalfamilies};
+			$totalfamilies =~ s/(\d{1,3}?)(?=(\d{3})+$)/$1,/g;
+			$p->text({rotate=>'0',align=>'center'},($top[0],$top[1]-$V-1), ,"$sharedfamilies / $totalfamilies" );
+		}
+	}
+	foreach my $s ( 1 .. $DIM  ) {
+		foreach my $q ( $s .. $DIM  ) {
+			my @top = ($TOP[0] - ($DIM-$q) * $V + ($s-1) * $V  , $TOP[1] - ($s-1) * $V - ($DIM - $q) * $V);
+			$p->setcolour ( 255,255,255);
+			$p->circle( {filled=>1} , $top[0] , $top[1] , $R );
+		}
+	}
+	my %GROUPS;
+	foreach my $q ( 1 .. $DIM  ) {
+		$p->setcolour ( 0,0,0);
+		$p->setfont("Palatino-Italic", 18);
+		$p->text({rotate=>'-45',align=>'right'},($TOP[0] - ($q-1) * $V - 0.7*$V, $TOP[1] - ($q-1) * $V), ,$INFO{$q-1}{title} );
+		$p->setfont("Palatino-Roman", 10);
+		$p->text({rotate=>'-45',align=>'right'},($TOP[0] - ($q-1) * $V - 0.5*$V - 5 - 1 , $TOP[1] - ($q-1) * $V - 5 + 1), ,$INFO{$q-1}{subtitle} );
+		my $genes = $INFO{$q-1}{genes};
+		$genes =~ s/(\d{1,3}?)(?=(\d{3})+$)/$1,/g;
+		my $totalfamilies = $table{$q-1}{$q-1}{totalfamilies};
+		$totalfamilies =~ s/(\d{1,3}?)(?=(\d{3})+$)/$1,/g;
+		$p->text({rotate=>'-45',align=>'right'},($TOP[0] - ($q-1) * $V - 0.5*$V - 8 - 1, $TOP[1] - ($q-1) * $V - 8 + 1 ), ,"$genes proteins, $totalfamilies families" );
+		if ( defined ( $xmlcfg->{sources}[0]->{entry}[$q-1]->{group}[0]) and defined ($xmlcfg->{sources}[0]->{entry}[$q-1]->{color}[0] ) )  {
+			$GROUPS{$xmlcfg->{sources}[0]->{entry}[$q-1]->{group}[0]} = $xmlcfg->{sources}[0]->{entry}[$q-1]->{color}[0];
+			$p->setcolour ( split (',' ,$xmlcfg->{sources}[0]->{entry}[$q-1]->{color}[0] ));
+			# 0.2 is the spacing between the arrows		
+			my	@BOX = (
+					$TOP[0] - ( $q - 1 ) * $V  - 2 - 0.3, $TOP[1] - (  $q  -  1) * $V + 2 - 0.3 , 
+					$TOP[0] - ( $q - 1 ) * $V  - 2.6 - 0.3, $TOP[1] - (  $q  - 1) * $V + 2.6 - 0.3, 
+					$TOP[0] - ( $q - 1 ) * $V  - $V  - 2.6 + 0.3 + 0.7 , $TOP[1] - (  $q  - 1) * $V - $V + 2.6 + 0.3 + 0.7  , 
+					$TOP[0] - ( $q - 1 ) * $V  - $V  - 2.6 + 0.3 -  10 + 0.7 , $TOP[1] - (  $q  - 1) * $V - $V + 2.6 + 0.3 + 10 + 0.7  , 
+					$TOP[0] - ( $q - 1 ) * $V  - $V  - 2.6 + 0.3 -  10, $TOP[1] - (  $q  - 1) * $V - $V + 2.6 + 0.3 + 10 , 
+					$TOP[0] - ( $q - 1 ) * $V  - $V-2 + 0.3 , $TOP[1] - (  $q  - 1) * $V - $V  +2 + 0.3  ,
+					$TOP[0] - ( $q - 1 + 0.5) * $V - 0.2 , $TOP[1] - (  $q  -  1 + 0.5) * $V  + 0.2 
+			);
+			$p->polygon({filled=>1},@BOX);
+		}
+	}
+	my $Q = 0; # used to position titles and color boxes
+	foreach my $s ( 1 .. $DIM  ) {
+		$p->setcolour ( 0 , 0 , 0 );
+		$p->setfont("Palatino-Italic", 18);
+		$p->text({rotate=>'45',align=>'left'},($TOP[0] + ($DIM-$s) * $V + 0.7*$V,$TOP[1] - ($DIM-$s) * $V), ,$INFO{$s-1}{title} );
+		$p->setfont("Palatino-Roman", 10);
+		$p->text({rotate=>'45',align=>'left'},($TOP[0] + ($DIM-$s) * $V + 0.5*$V + 5 + 1  ,$TOP[1] - ($DIM-$s) * $V - 5  + 1 ), ,$INFO{$s-1}{subtitle} );
+		my $genes = $INFO{$s-1}{genes};
+		$genes =~ s/(\d{1,3}?)(?=(\d{3})+$)/$1,/g;
+		my $totalfamilies = $table{$s-1}{$s-1}{totalfamilies};
+		$totalfamilies =~ s/(\d{1,3}?)(?=(\d{3})+$)/$1,/g;
+		$p->text({rotate=>'45',align=>'left'},($TOP[0] + ($DIM-$s) * $V + 0.5*$V + 8 + 1 ,$TOP[1] - ($DIM-$s) * $V - 8 + 1), ,"$genes proteins, $totalfamilies families" );
+		if ( defined ( $xmlcfg->{sources}[0]->{entry}[$s-1]->{group}[0]) and defined ($xmlcfg->{sources}[0]->{entry}[$s-1]->{color}[0] ) )  {
+			$p->setcolour ( split (',' ,$xmlcfg->{sources}[0]->{entry}[$s-1]->{color}[0] ));
+			my	@BOX = (
+		 		$TOP[0] + ( $DIM-$s ) * $V  + 2 + 0.3, $TOP[1] - (  $DIM-$s) * $V + 2 - 0.3, 
+			 	$TOP[0] + ( $DIM-$s ) * $V  + 2.6 + 0.3, $TOP[1] - (  $DIM-$s) * $V + 2.6 - 0.3, 
+			 	$TOP[0] + ( $DIM-$s ) * $V  + $V  + 2.6 - 0.3 -  0.7, $TOP[1] - (  $DIM-$s) * $V - $V + 2.6 + 0.3 + 0.7, 
+			 	$TOP[0] + ( $DIM-$s ) * $V  + $V  + 2.6 - 0.3 + 10 - 0.7, $TOP[1] - (  $DIM-$s) * $V - $V + 2.6 + 0.3 + 10 + 0.7, 
+			 	$TOP[0] + ( $DIM-$s ) * $V  + $V  + 2.6 - 0.3 + 10, $TOP[1] - (  $DIM-$s) * $V - $V + 2.6 + 0.3 + 10, 
+			 	$TOP[0] + ( $DIM-$s ) * $V  + $V+2 - 0.3 , $TOP[1] - (  $DIM-$s) * $V - $V  +2 + 0.3  ,
+		 		$TOP[0] + ( $DIM-$s + 0.5) * $V + 0.2 , $TOP[1] - (  $DIM-$s + 0.5) * $V  + 0.2 
+		);
+			$p->polygon({filled=>1},@BOX);
+			}
+
+	}
+
+	my $inc = 1/$legendSteps;
+	my $legendBoxWidth = $legendWidth / $legendSteps;
+	my $legendYpos_paralogs = $TOP_BOTTOM_MARGIN[1]+8;
+	my $legendYpos_orthlogs = $YSIZE - $TOP_BOTTOM_MARGIN[0] - 12 - $legendHeight;
+	my $legendXpos = $XSIZE - $LEFT_RIGHT_MARGIN[1] - $legendWidth - $legendDist;
+		$p->setcolour ( 0 , 0 , 0 );
+
+	$p->setfont("Palatino-Roman", 18);
+	$p->setfont("Palatino-Roman", 24) if $large;
+
+	$p->text({rotate=>'0',align=>'center'}, $legendXpos + $legendWidth / 2 , $legendYpos_paralogs+$legendHeight+2 , ,"Homology within proteomes");
+	$p->setfont("Palatino-Roman", 18);
+	$p->setfont("Palatino-Roman", 24) if $large;
+	$p->text({rotate=>'0',align=>'center'},( $legendXpos + $legendWidth), $legendYpos_paralogs-9 , ,sprintf('%0.1f',(100*$displayMax{"paralogs"})).' %');
+	$p->text({rotate=>'0',align=>'center'}, $legendXpos, $legendYpos_paralogs-9 , ,sprintf('%0.1f',(100*$displayMin{"paralogs"})).' %');
+	for (my $i = 0 ; $i <= 1 ; $i+=$inc) {
+		$p->setcolour ( (  score2RGB("paralogs",$i) ));
+		my @BOX = (
+			$legendXpos + (($i ) * $legendWidth) , $legendYpos_paralogs , 
+			$legendXpos + (($i ) * $legendWidth), $legendYpos_paralogs+$legendHeight , 
+			$legendXpos + (($i + $inc )* $legendWidth), $legendYpos_paralogs+$legendHeight , 
+			$legendXpos + (($i + $inc ) * $legendWidth), $legendYpos_paralogs 
+		);
+		$p->polygon({filled=>1},@BOX);
+	}
+	$p->setcolour ( 0,0,0);
+	$p->setfont("Palatino-Bold", 22);
+	if ( defined ( $xmlcfg->{title}[0] ) ) {
+		$p->text({rotate=>'0',align=>'left'},( $LEFT_RIGHT_MARGIN[0], $legendYpos_paralogs + 3 ), ,$xmlcfg->{title}[0]);
+	}
+	$p->setfont("Palatino-Roman", 18);
+	if ( defined ( $xmlcfg->{subtitle}[0] ) ) {
+		$p->text({rotate=>'0',align=>'left'}, ($LEFT_RIGHT_MARGIN[0], $legendYpos_paralogs - 4 ) , ,$xmlcfg->{subtitle}[0]);
+	}
+	$p->setcolour ( 0,0,0);
+	$p->setfont("Palatino-Roman", 18);
+	$p->setfont("Palatino-Roman", 24) if $large;
+	$p->text({rotate=>'0',align=>'center'},$legendXpos + $legendWidth / 2 , $legendYpos_orthlogs+$legendHeight+2 , ,"Homology between proteomes");
+	$p->setfont("Palatino-Roman", 18);
+	$p->setfont("Palatino-Roman", 24) if $large;
+	$p->text({rotate=>'0',align=>'center'},($legendXpos + $legendWidth), $legendYpos_orthlogs-9 , ,sprintf('%0.1f',100*$displayMax{"orthologs"}).' %');
+	$p->text({rotate=>'0',align=>'center'},$legendXpos, $legendYpos_orthlogs-9 , ,sprintf('%0.1f',100*$displayMin{"orthologs"}).' %');
+	for (my $i = 0 ; $i <= 1 ; $i+=$inc) {
+		$p->setcolour ( (  score2RGB("orthologs",$i) ));
+		my @BOX = (
+			$legendXpos + (($i ) * $legendWidth) , $legendYpos_orthlogs , 
+			$legendXpos + (($i ) * $legendWidth), $legendYpos_orthlogs+$legendHeight , 
+			$legendXpos + (($i + $inc )* $legendWidth), $legendYpos_orthlogs+$legendHeight , 
+			$legendXpos + (($i + $inc ) * $legendWidth), $legendYpos_orthlogs 
+		);
+		$p->polygon({filled=>1},@BOX);
+	}
+	$p->setcolour ( 200,200,200);
+	$p->setlinewidth(1.5);
+	$p->line ( 
+	$XSIZE-$LEFT_RIGHT_MARGIN[1] - 4  , $YSIZE-$TOP_BOTTOM_MARGIN[0] , 
+	$XSIZE-$LEFT_RIGHT_MARGIN[1]  ,     $YSIZE-$TOP_BOTTOM_MARGIN[0] 
+	);
+	$p->linextend ( 
+		$XSIZE-$LEFT_RIGHT_MARGIN[1] , $YSIZE - $TOP_BOTTOM_MARGIN[0] -  $horzVertTextdim - $V * $DIM + 1 
+	);
+	$p->linextend ( 
+		$XSIZE-$LEFT_RIGHT_MARGIN[1] -12  , $YSIZE - $TOP_BOTTOM_MARGIN[0] -  $horzVertTextdim - $V * $DIM + 1 
+	);
+	$p->line ( 
+		$XSIZE-$LEFT_RIGHT_MARGIN[1] -12  ,  $YSIZE - $TOP_BOTTOM_MARGIN[0] -  $horzVertTextdim - $V * $DIM - 1, 
+		$XSIZE-$LEFT_RIGHT_MARGIN[1]  ,  $YSIZE - $TOP_BOTTOM_MARGIN[0] -  $horzVertTextdim - $V * $DIM - 1 
+	);
+	$p->linextend ( 
+		$XSIZE-$LEFT_RIGHT_MARGIN[1]  , $TOP_BOTTOM_MARGIN[1]
+	) ;
+	$p->linextend ( 
+		$XSIZE-$LEFT_RIGHT_MARGIN[1] -4 , $TOP_BOTTOM_MARGIN[1]
+	) ;
+	$p->output("-");
+}
+
+sub fraction2score {
+	my ($type , $fraction) = @_;
+	my $slope = 1/($displayMax{$type} - $displayMin{$type});
+	my $intercept = 1 - ($slope * $displayMax{$type});
+	my $score = ($fraction*$slope) + $intercept;
+	return $score;
+}
+
+sub score2RGB {
+	# for instance 'paralogs'
+	my ( $type , $score ) = @_;
+	$score = 0 if $score < 0;
+	$score = 1 if $score > 1;
+	my @startColors = ($xmlcfg->{settings}[0]->{$type}[0]->{from_color}[0]->{r}[0],$xmlcfg->{settings}[0]->{$type}[0]->{from_color}[0]->{g}[0],$xmlcfg->{settings}[0]->{$type}[0]->{from_color}[0]->{b}[0]);
+	my @endColors = ($xmlcfg->{settings}[0]->{$type}[0]->{to_color}[0]->{r}[0],$xmlcfg->{settings}[0]->{$type}[0]->{to_color}[0]->{g}[0],$xmlcfg->{settings}[0]->{$type}[0]->{to_color}[0]->{b}[0]);
+	my @resultColor;
+	foreach my $x (0 .. 2) {
+		$resultColor[$x] = sprintf ( "%0.1f" ,( $startColors[$x] + ($endColors[$x] - $startColors[$x]) * $score) * 256);
+	}
+	return @resultColor;
+}
+
+sub setupRanges {
+	$displayMin{paralogs}  = $lowestFraction{paralogs};
+	$displayMax{paralogs}  = $highestFraction{paralogs};
+	$displayMin{orthologs} = $lowestFraction{orthologs};
+	$displayMax{orthologs} = $highestFraction{orthologs};
+	foreach my $t ('orthologs','paralogs') {
+		$displayMin{$t} = $xmlcfg->{settings}[0]->{$t}[0]->{range_from}[0] if ( $xmlcfg->{settings}[0]->{$t}[0]->{range_from}[0] ne 'auto');
+		$displayMax{$t} = $xmlcfg->{settings}[0]->{$t}[0]->{range_to}[0] if ( $xmlcfg->{settings}[0]->{$t}[0]->{range_to}[0] ne 'auto');
+	}
+	printf STDERR "setupRanges() : disp.paralogs........%0.4f..%0.4f\n",$displayMin{paralogs},$displayMax{paralogs};
+	printf STDERR "setupRanges() : disp.orthologs.......%0.4f..%0.4f\n",$displayMin{orthologs},$displayMax{orthologs};
+	printf STDERR "setupRanges() : fractions.paralogs...%0.4f..%0.4f\n",$lowestFraction{paralogs},$highestFraction{paralogs};
+	printf STDERR "setupRanges() : fractions.orthologs..%0.4f..%0.4f\n",$lowestFraction{orthologs},$highestFraction{orthologs};
+}
+
+sub fasta2fasta {
+	my ($input,$output) = @_;
+	my $temp = "$output.temp.raw";
+	my $nprot = 0;
+	my $skipped = 0;
+	open RAW , "| saco_convert -I fasta -O raw | sort > $temp" or die $!;
+	open FASTA , $input;
+	while (<FASTA>) {
+		print RAW;
+	}	
+	close FASTA;
+	close RAW;
+	my $checksum = md5 ( $temp ) ;
+	open FASTA , "| saco_convert -I tab -O fasta > $output";
+	open RAW , $temp or die $!;
+	while (<RAW>) {
+		if ( /^([A-Za-z]+)/ ) {
+			$nprot++;
+			print FASTA "$checksum.$nprot\t$1\n";
+		} else {
+			$skipped++;
+		}
+	}
+	close FASTA;
+	close RAW;
+	unlink $temp;
+	return ($nprot,$skipped , $checksum);
+}
+
+sub md5 {
+	my @files = @_;
+	my $md5 = Digest::MD5->new;
+	foreach my $file (@files) {
+		open(FILE, $file) or die "Can't open '$file': $!";
+		binmode(FILE);
+		while (<FILE>) {
+			$md5->add($_);
+		}
+		close(FILE);
+	}
+	return $md5->hexdigest;
+}

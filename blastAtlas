@@ -1,0 +1,686 @@
+#!/usr/bin/perl -w
+# Authors: Thomas Dybdal Pedersen
+# For license see /usr/biotools/CMG-biotools.license
+use strict;
+use Getopt::Long;
+
+#### INPUT CHECK
+my $organism;
+my $config;
+my $output;
+my $tidy;
+
+if ($#ARGV < 0){
+	print "\n";
+	print "USAGE: blastAtlas -f <organismName> -c <configFile> -o <outputFile> -tidy\n";
+	print "Creates a blast atlas of the organism given in <organismName> based on the setup in the config file.\n";
+	print "\n";
+	print "-f\tThe name of the gbk file to use; with or without the .gbk extension <REQUIRED>\n";
+	print "-c\tThe name of the config file created by blastAtlasCf <REQUIRED>\n";
+	print "-o\tThe name of the plot file to create. If not specified no plot will be made.\n\tA plot can subsequently be created with \`genewiz -p <outputFile> <configFile>\`\n";
+	print "-tidy\tOnly used if plot is created. If set, all created files except for the plot\n\twill be deleted when the program finishes\n";
+	print "\n";
+	exit;
+}
+
+GetOptions ("f=s"	=> \$organism,
+			"c=s"	=> \$config,
+			"o=s"	=> \$output,
+			"tidy"	=> \$tidy);
+	
+if ($organism){
+	$organism =~ s/\.gbk//;
+}
+else {
+	die "No organism defined: use -f <organism>\n";
+}
+if(! -e "${organism}.gbk"){
+	die "Missing genbank file: ${organism}.gbk\n";
+}
+if(! -e "${config}"){
+	die "Missing config file: ${config}\n";
+}
+if($output){
+	if($output eq "1"){
+		print "No output name specified. Using ${organism}.ps\n";
+		$output = "${organism}.ps"
+	}
+}
+
+
+#### END OF INPUT CHECK
+
+#### PARSING GENE DATA
+my @tab = `/usr/biotools/saco_convert -I genbank -O tab ${organism}.gbk`;
+chomp(my $length = `/usr/biotools/saco_convert -I genbank -O length $organism.gbk`);
+#### END OF PARSING DATA
+
+
+#### CREATING DATA FILES
+`/usr/biotools/saco_convert -I genbank -O annotation ${organism}.gbk > ${organism}.ann`;
+print STDOUT "Calculating reference genome statistics... ";
+&curvature;
+&ornstein;
+&travers;
+&repeats;
+&baseskews;
+print STDOUT "DONE\n";
+
+my @scales = &extractcm2;
+foreach(@scales){
+	my $scale = $_;
+	&cm2("${scale}");
+}
+my @queries = &extractQuery;
+`saco_extract -I genbank -O fasta -t ${organism}.gbk > ${organism}.BAref.fsa`;
+`formatdb -i ${organism}.BAref.fsa -p T`;
+foreach(@queries){
+	my $query = $_;
+	$query =~ s/.genomemap.gz$//;
+	print STDOUT "Blasting $_... ";
+	&blastlane("${query}");
+	print STDOUT "DONE\n";
+}
+my @filelist = ("formatdb.log", "${organism}.BAref.fsa", "${organism}.BAref.fsa.phr", "${organism}.BAref.fsa.pin", "${organism}.BAref.fsa.psq");
+foreach (@filelist){
+	unlink;
+}
+#### END OF DATA FILE CREATION
+
+
+#### CREATING PLOT
+if ($output){
+	`genewiz -p ${output} ${config}`;
+	if($tidy){
+		foreach(@scales){
+			$_ = "${_}.cm2";
+			unlink $_;
+		}
+		my @files = ("${organism}.baseskews.col.gz", "${organism}.ann", "${organism}.blast.Direct.gz", "${organism}.blast.Inverted.gz", "${organism}.curvature.gz", "${organism}.genomeatlas.cf", "${organism}.ornstein.gz", "${organism}.travers.gz");
+		foreach (@files){
+			unlink $_;
+		}
+		foreach (@queries){
+			unlink;
+		}
+	}
+}
+#### END OF PLOT CREATION
+
+
+#### SUBROUTINE DEFINITION
+sub extractcm2 {
+	open CONFIG, "<", "${config}";
+	my @list;
+	while(<CONFIG>){
+		my @match = /[0-9_]+\.cm2/ig;
+		@list = (@list, @match);
+	}
+	foreach (@list){
+		s/\.cm2//ig;
+	}
+	@list;
+}
+sub extractQuery {
+	open CONFIG, "<", "${config}";
+	my @list;
+	while(<CONFIG>){
+		my @match = /\s.+\.genomemap\.gz/ig;
+		@list = (@list, @match);
+	}
+	my %seen = ();
+	@list = grep { !$seen{$_}++ } @list;
+}
+sub blastlane {
+	my $input = $_[0];
+	`/usr/biotools/blast/bin/blastall -p blastp -d ${organism}.BAref.fsa -i ${input} -e 1e-5 -v 1 -b 1 -m7  > ${input}.proteins.blastreport`;
+	my $line = 1;
+	my %hash;
+	my %hits;
+	open BLASTRES, "<${input}.proteins.blastreport";
+	while ( defined ( $line = <BLASTRES> ) ) {
+		if ($line =~ m/<\/Hsp>/) {
+			if ($hash{'BlastOutput_query-len'}){
+				if ($hash{'BlastOutput_query-len'}){
+					my $qlen = $hash{'BlastOutput_query-len'}+0;
+					my $slen = $hash{'Hit_len'}+0;
+					if ($qlen > $slen) {
+						$hash{"ALR"} = $hash{'Hsp_align-len'} / $qlen;
+					}
+					elsif($qlen <= $slen) {
+						$hash{"ALR"} = $hash{'Hsp_align-len'} / $slen;
+					}
+					if ($hash{"ALR"} > 0.75){
+						$hash{"Hit_def"} =~ /^[^\t]*CDS_(\d+)\-(\d+).*/;
+						$hits{$1}{$2} = $hash{"Hsp_evalue"};
+					}
+					undef(%hash);
+				}
+			}
+		}
+		if ($line =~ m/<(.*)>(.*)<\/.*>/) {
+			$hash{$1} = $2;
+		}
+	}
+	close BLASTRES;
+	my @newAnn;
+	my $evalue;
+	open ANN, "<${organism}.ann";
+	while (<ANN>){
+		next unless /CDS[\s\t]+(\d+)[\s\t]+(\d+)[\s\t]+([\-\+]+)/;
+		my ($start,$stop,$dir) = ($1,$2,$3);
+		undef($evalue);
+		$evalue = $hits{$start}{$stop} if (defined ($hits{$start}{$stop}));
+		$evalue = $hits{$stop}{$start} if (defined ($hits{$stop}{$start}));
+		if ( defined ( $evalue) ) {
+			$evalue = 1e-100 if $evalue == 0;
+		}
+		else {
+			next;
+		}
+		$evalue = sprintf ("%0.4f",-log($evalue));
+		push (@newAnn, "CDS\t${start}\t${stop}\t${dir}\t${evalue}");
+	}
+	close ANN;
+	my $a=0;
+	my $d;
+	my @e;
+	foreach (@newAnn){
+		my @line = split(/\s+/, $_);
+		my $nf = @line;
+		if ($line[2] > $a) {
+			$a = $line[2];
+		}
+		$d = $line[4];
+		for (my $i = $line[1]; $i <= $line[2]; $i++) {
+			$e[$i] = $d;
+		}
+	}
+	my @ans;		
+	for (my $i = 1; $i <= $a; $i++) {
+		if (defined $e[$i]) {
+			$ans[$i-1] = $e[$i]."\n";
+		} else {
+			$ans[$i-1] = "0\n";
+		}
+	}
+	open OUT, ">${input}.genomemap";
+	foreach (@ans){
+		print OUT;
+	}
+	close OUT;
+	`gzip -c ${input}.genomemap > ${input}.genomemap.gz`;
+	
+	my @files = ("${input}.genomemap", "${input}.proteins.blastreport");
+	foreach (@files){
+		unlink $_ or `rm $_`;
+	}
+	unlink "error.log";
+}
+sub cm2 {
+	# Authors: Peter Fisher Hallin
+	# For license see /usr/biotools/CMG-biotools.license
+	open OUT, ">", "${_[0]}.cm2";
+	select OUT;
+	
+	my @input = split(/[-_]/, $_[0]);
+	my $r = 0.1*substr($input[0], 0, 2);
+	my $g = 0.1*substr($input[0], 2, 2);
+	my $b = 0.1*substr($input[0], 4, 2);
+	
+	printf "%1.2f %1.2f %1.2f\n", 0.3*$r, 0.3*$g, 0.3*$b unless $r == 1 && $g == 1 && $b == 1;
+	
+	my $i;
+	for ($i = 0; $i < $#input; $i++) {
+		$r = 0.1*substr($input[$i], 0, 2);
+		my $rf = 0.1*substr($input[$i+1], 0, 2)-$r;
+		$g = 0.1*substr($input[$i], 2, 2);
+		my $gf = 0.1*substr($input[$i+1], 2, 2)-$g;
+		$b = 0.1*substr($input[$i], 4, 2);
+		my $bf = 0.1*substr($input[$i+1], 4, 2)-$b;
+		my $j = 0;
+		while ($j < 0.895) {
+			printf "%1.2f %1.2f %1.2f\n", 0.9*$r+$j*$rf, 0.9*$g+$j*$gf, 0.9*$b+$j*$bf;
+			if ($rf > 0 || $gf > 0 || $bf > 0) {
+				if ($j < 0.45) {
+					$j += 0.1;
+				}
+				elsif ($j < 0.825) {
+					$j += 0.05;
+				}
+				else {
+		        	$j += 0.01;
+				}
+			}
+			else {
+				if ($j < 0.045) {
+					$j += 0.01;
+				}
+				elsif ($j < 0.375) {
+					$j += 0.05;
+				}
+				else {
+					$j += 0.10;
+				}
+			}
+		}
+	}
+	
+	$r = 0.1*substr($input[$i], 0, 2);
+	$g = 0.1*substr($input[$i], 2, 2);
+	$b = 0.1*substr($input[$i], 4, 2);
+	
+	printf "%1.2f %1.2f %1.2f\n", 0.9*$r, 0.9*$g, 0.9*$b;
+	printf "%1.2f %1.2f %1.2f\n", 0.3*$r, 0.3*$g, 0.3*$b unless $r == 1 && $g == 1 && $b == 1;
+	
+	close OUT;
+}
+sub repeats {
+	open FSA, ">", "${organism}.db";
+	select FSA;
+	foreach (@tab) {
+		my @tmp = split(/\t/, $_);
+		$tmp[0] = "XXXX" unless $tmp[0];
+		my $w = 10000;
+		my $o = 5000;
+		my $l = length($tmp[1]);
+		for (my $i = 0; $i <= $l; $i += $o){
+			my $s2 = substr($tmp[1], $i, $w);
+			my $ls2 = length($s2);
+			if ($ls2 < $w) {
+				my $pad = $w-$ls2;
+				$pad = "X"x$pad;
+				$s2 = $s2.$pad;
+			}
+			$s2 =~ s/(.{60})/$1\n/g;
+			print ">".$tmp[0]."_".eval($i+1)."-".eval($i+$w+1)."\n"; 
+			print $s2."\n";
+		}
+	}
+	close FSA;
+	
+	`/usr/biotools/blast/bin/formatdb -i ${organism}.db -p F -t ${organism}.db`;
+	`/usr/biotools/blast/bin/blastall -p blastn -F F -g F -d ${organism}.db -e 1 -i ${organism}.db -o ${organism}.blast`;
+	
+	my @blasttable = `/usr/biotools/indirect/blastntable.pl ${organism}.blast`;
+
+	my @direct;
+	my @inverted;
+	my $countD = 0;
+	my $countI = 0;
+	
+	foreach(@blasttable){
+		sub solveE {
+			my $ans;
+			my @input = @_;
+			my @char = split(//, $input[0]);
+			if ($char[0] eq "e"){
+				$ans = "1".$input[0];
+			} else {
+				$ans = $input[0];
+			}
+			$ans;
+		}
+		my @F = split;
+		$F[16] =~ /_([0-9]+)-[0-9]+$/;
+		my $c = $1+$F[10]-1;
+		my $d = $1+$F[11]-1;
+		$F[17] =~ /_([0-9]+)-[0-9]+$/;
+		my $e = $1+$F[13]-1;
+		my $f = $1+$F[14]-1;
+		my $g = solveE($F[7]);
+		if ($F[12] eq $F[15] && $d-$c >= 50 && $c != $e){
+			$direct[$countD] = sprintf("BLAST %8d %8d  +  %4.2f %s %d %s %d\n", $c, $d, -log($g+1e-9)/log(10), $F[16], $c, $F[17], $e);
+			$countD++;
+		} elsif ($F[12] ne $F[15] && $d-$c >= 50 && $c != $e){
+			$inverted[$countI] = sprintf("BLAST %8d %8d  +  %4.2f %s %d %s %d\n", $c, $d, -log($g+1e-9)/log(10), $F[16], $c, $F[17], $e);
+			$countI++;
+		}
+	}
+	
+	sub tempsort {
+		my @aa = split(/\s+/, $a);
+		my @bb = split(/\s+/, $b);
+		$aa[4] <=> $bb[4];
+	}
+	
+	@direct = reverse sort tempsort @direct;
+	@inverted = reverse sort tempsort @inverted;
+	
+	unshift(@direct, sprintf("BLAST %8d %8d  +  %4.2f\n", 1, $length, 0));
+	unshift(@inverted, sprintf("BLAST %8d %8d  +  %4.2f\n", 1, $length, 0));
+	
+	sub convertBlast{
+		my $a = 0;
+		my $b = 0;
+		my @c;
+		my $d;
+		my @e;
+		
+		foreach (@_) {
+			my @line = split(/\s+/, $_);
+			my $nf = @line;
+			if ($line[2] > $a) {
+				$a = $line[2];
+			}
+			$b++;
+			$c[4] += 0;
+			$d = $line[4];
+			for (my $i = 5; $i < $nf; $i++) {
+				$c[$i] += 0;
+				$d = $d."\t".$line[$i];
+			}
+			for (my $i = $line[1]; $i <= $line[2]; $i++) {
+				$e[$i] = $d;
+			}
+		}
+		
+		my @ans;
+		
+		for (my $i = 1; $i <= $a; $i++) {
+			if (defined $e[$i]) {
+				$ans[$i-1] = $e[$i]."\n";
+			} else {
+				$ans[$i-1] = sprintf("%s", $c[5]/($b != 0 ? $b : 1));
+				for (my $j = 5; defined $c[$j]; $j++) {
+					$ans[$i-1] = sprintf("\t%s", $c[$j]/($b != 0 ? $b : 1));
+				}
+				$ans[$i-1] = sprintf("\n");
+			}
+		}
+		
+		@ans;
+	}
+	
+	@direct = convertBlast(@direct);
+	@inverted = convertBlast(@inverted);
+	
+	open DIRECT, ">", "${organism}.blast.Direct";
+	select DIRECT;
+	foreach(@direct){
+		print;
+	}
+	close DIRECT;
+	`gzip -c ${organism}.blast.Direct > ${organism}.blast.Direct.gz`;
+	
+	open INVERTED, ">", "${organism}.blast.Inverted";
+	select INVERTED;
+	foreach(@inverted){
+		print;
+	}
+	close INVERTED;
+	`gzip -c ${organism}.blast.Inverted > ${organism}.blast.Inverted.gz`;
+	
+	my @files = ("${organism}.blast", "${organism}.blast.Direct", "${organism}.blast.Inverted", "${organism}.db", "${organism}.db.nhr", "${organism}.db.nin", "${organism}.db.nsq", "formatdb.log", "error.log");
+	foreach (@files){
+		unlink $_;
+	}
+}
+sub travers {
+	my @temptab = @tab;
+	my %val = (
+		"AAA" => 0.36,
+		"AAC" => 0.06,
+		"AAG" => 0.06,
+		"AAT" => 0.30,
+		"ACA" => 0.06,
+		"ACC" => 0.08,
+		"ACG" => 0.08,
+		"ACT" => 0.11,
+		"AGA" => 0.09,
+		"AGC" => 0.25,
+		"AGG" => 0.08,
+		"AGT" => 0.11,
+		"ATA" => 0.13,
+		"ATC" => 0.07,
+		"ATG" => 0.18,
+		"ATT" => 0.30,
+		"CAA" => 0.09,
+		"CAC" => 0.17,
+		"CAG" => 0.02,
+		"CAT" => 0.18,
+		"CCA" => 0.08,
+		"CCC" => 0.13,
+		"CCG" => 0.02,
+		"CCT" => 0.08,
+		"CGA" => 0.31,
+		"CGC" => 0.25,
+		"CGG" => 0.02,
+		"CGT" => 0.08,
+		"CTA" => 0.18,
+		"CTC" => 0.08,
+		"CTG" => 0.02,
+		"CTT" => 0.06,
+		"GAA" => 0.12,
+		"GAC" => 0.08,
+		"GAG" => 0.08,
+		"GAT" => 0.07,
+		"GCA" => 0.13,
+		"GCC" => 0.45,
+		"GCG" => 0.25,
+		"GCT" => 0.25,
+		"GGA" => 0.05,
+		"GGC" => 0.45,
+		"GGG" => 0.13, 
+		"GGT" => 0.08,
+		"GTA" => 0.06,
+		"GTC" => 0.08,
+		"GTG" => 0.17,
+		"GTT" => 0.06,
+		"TAA" => 0.20,
+		"TAC" => 0.06,
+		"TAG" => 0.18,
+		"TAT" => 0.13,
+		"TCA" => 0.08,
+		"TCC" => 0.05,
+		"TCG" => 0.31,
+		"TCT" => 0.09,
+		"TGA" => 0.08,
+		"TGC" => 0.13,
+		"TGG" => 0.08,
+		"TGT" => 0.06,
+		"TTA" => 0.20,
+		"TTC" => 0.12,
+		"TTG" => 0.09,
+		"TTT" => 0.36
+	);
+	
+	open TRAVERS, ">", "${organism}.travers";
+	select TRAVERS;
+	foreach (@temptab) {
+		$_ = uc;
+		my @seq = split(/\t/, $_);
+		for (my $i = 0; $i+3 <= length($seq[1]); $i++) {
+			if (defined($val{substr($seq[1], $i, 3)})) {
+				printf("%.3f\n", $val{substr($seq[1], $i, 3)});
+			} else {
+				print "\n";
+			}
+		}
+	}
+	close TRAVERS;
+	
+	`gzip -c ${organism}.travers > ${organism}.travers.gz`;
+	unlink "${organism}.travers";
+}
+sub ornstein {
+	my @temptab = @tab;
+	my %val = (
+		"AA" => -5.37,
+		"AC" => -10.51,
+		"AG" => -6.78,
+		"AT" => -6.57,
+		"CA" => -6.57,
+		"CC" => -8.26,
+		"CG" => -9.61,
+		"CT" => -6.78,
+		"GA" => -9.81,
+		"GC" => -14.59,
+		"GG" => -8.26,
+		"GT" => -10.51,
+		"TA" => -3.82,
+		"TC" => -9.81,
+		"TG" => -6.57,
+		"TT" => -5.37
+	);
+	
+	open ORNSTEIN, ">", "${organism}.ornstein";
+	select ORNSTEIN;
+	foreach (@temptab) {
+		$_ = uc;
+		my @seq = split(/\t/, $_);
+		for (my $i = 0; $i+2 <= length($seq[1]); $i++) {
+			if (defined($val{substr($seq[1], $i, 2)})) {
+				printf("%.3f\n", $val{substr($seq[1], $i, 2)});
+			} else {
+				print "\n";
+			}
+		}
+	}
+	close ORNSTEIN;
+	
+	`gzip -c ${organism}.ornstein > ${organism}.ornstein.gz`;
+	unlink "${organism}.ornstein";
+}
+sub baseskews {
+	`/usr/biotools/saco_convert -A dna2 -I genbank -O skews ${organism}.gbk > ${organism}.baseskews.col`;
+	`gzip -c ${organism}.baseskews.col > ${organism}.baseskews.col.gz`;
+	unlink "${organism}.baseskews.col";
+}
+sub curvature {
+	&createAngles;
+	
+	chomp(my @raw = `/usr/biotools/saco_convert -I genbank -O raw ${organism}.gbk`);
+	
+	foreach (@raw){
+		next unless length($_) >= 21;
+		s/[^ATGCatgc]/G/g;
+		s/(.{60})/$1\n/g;
+		$_ =uc ($_)."\n";
+	}
+	open SEQ, ">", "${organism}.seq";
+	foreach (@raw){
+		print SEQ $_;
+	}
+	close SEQ;
+	
+	`/usr/biotools/indirect/curva  -f ${organism}.seq -o ${organism}.map`;
+	
+	open MAP, "<", "${organism}.map";
+	open CURVATURE, ">", "${organism}.curvature";
+	while (<MAP>){
+		(my $index, my $curvature) = split(/\s+/, "$_");
+		print CURVATURE $curvature."\n";
+	}
+	close MAP;
+	close CURVATURE;
+	
+	`gzip -c ${organism}.curvature > ${organism}.curvature.gz`;
+	
+	my @files = ("angles.dat", "${organism}.curvature", "work.0", "${organism}.map", "${organism}.seq", "${organism}.ou2");
+	foreach (@files){
+		unlink $_;
+	}
+}
+sub average{
+	my @data = @_;
+	if (! @data) {
+		die("Empty array\n");
+	}
+	my $total = 0;
+	foreach (@data) {
+		$total += $_;
+	}
+	my $average = $total / @data;
+	return $average;
+}
+sub stdev{
+	my @data = @_;
+	if(@data == 1){
+		return 0;
+	}
+	my $average = &average(@data);
+	my $sqtotal = 0;
+	foreach(@data) {
+		$sqtotal += ($average-$_) ** 2;
+	}
+	my $std = ($sqtotal / (@data-1)) ** 0.5;
+	return $std;
+}
+sub Zscore {
+	my $type = $ARGV[1];
+	my $pathToNucStat;
+	my $length;
+	if (uc($type) eq "DOUBLE"){
+		$pathToNucStat = "/Users/Thomas/Documents/Biotools/bin/double.csv";
+		$length = 2;
+	} else {	
+		if (uc($type) eq "TRIPLE"){
+			$pathToNucStat = "/Users/Thomas/Documents/Biotools/bin/triple.csv";
+			$length = 3;
+		} else {
+			die "Invalid argument.\n";
+		}
+	}
+	my %nucStat;
+	my @rowavg;
+	my @stat;
+	my @score;
+	if(! open NUCSTAT, "<", $pathToNucStat) {
+		die "Couldn\'t read $pathToNucStat\n"
+	}
+	if(! open INPUT, "<", $ARGV[0]) {
+		die "Couldn\'t read $ARGV[0]\n"
+	}
+	%nucStat = split (",", join ",", <NUCSTAT>);
+	my $j = 0;
+	while (<INPUT>) {
+		$_ = uc;
+		my @seq = split(/\t/, $_);
+		my $obs = 0;
+		my $sum = 0;
+		for (my $i = 0; $i+$length <= length($seq[1]); $i++) {
+			if (defined($nucStat{substr($seq[1], $i, $length)})) {
+				$obs++; 
+				$sum += $nucStat{substr($seq[1], $i, $length)};
+			}
+		}
+		if ($obs) {
+			$rowavg[$j] = $sum/$obs;
+			$j++;
+		}
+	}
+	@stat = (&average(@rowavg), &stdev(@rowavg));
+	$j = 0;
+	foreach (@rowavg){
+		$score[$j] = ($_-$stat[0])/$stat[1];
+		$j++;
+	}
+	@score;
+}
+sub createAngles {
+	open ANGLES, ">", "angles.dat";
+	select ANGLES;
+	print "           TWIST            WEDGE             DIRECTION          \n";
+	print "\n";
+	print "AA         35.62             7.20              -154.00\n";
+	print "AC         34.40             1.10               143.00\n";
+	print "AG         27.70             8.40                 2.00\n";
+	print "AT         31.50             2.60                 0.00\n";
+	print "CA         34.50             3.50               -64.00\n";
+	print "CC         33.67             2.10               -57.00\n";
+	print "CG         29.80             6.70                 0.00\n";
+	print "CT         27.70             8.40                -2.00\n";
+	print "GA         36.90             5.30               120.00\n";
+	print "GC         40.00             5.00               180.90\n";
+	print "GG         33.67             2.10                57.00\n";
+	print "GT         34.40             1.10              -143.00\n";
+	print "TA         36.00             0.90                 0.00\n";
+	print "TC         36.90             5.30              -120.00\n";
+	print "TG         34.50             3.50                64.00\n";
+	print "TT         35.62             7.20               154.00\n";
+	print "\n";
+	print "\n";
+	close ANGLES;
+}
+#### END OF SUBROUTINE DEFINITION
