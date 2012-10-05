@@ -1,0 +1,26 @@
+#!/usr/bin/perl
+
+use strict;
+use Getopt::Long;
+
+my $input;
+my $name;
+my $output;
+
+GetOptions ("f=s"	=> \$input,
+			"n=s"	=> \$name,
+			"o=s"	=> \$output);
+			
+open IN, "<${input}" or die;
+open OUT, ">${output}";
+
+while (<IN>){
+	if(m/^>.*/){
+		chomp;
+		my @line = split("_", $_);
+		print OUT ">".$name."_".$line[1]."_".$line[2]."\n";
+	}
+	else {
+		print OUT $_;
+	}
+}
